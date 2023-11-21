@@ -1,132 +1,144 @@
+import './globals'
+
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeaders } from 'node:http'
 import type { Http2ServerRequest, Http2ServerResponse } from 'node:http2'
+import { HonoRequest } from './request'
 import type { FetchCallback } from './types'
-import './globals'
-import './response'
-import { requestPrototype } from './request'
-import { writeFromReadableStream, buildOutgoingHttpHeaders } from './utils'
-
-const regBuffer = /^no$/i
-const regContentType = /^(application\/json\b|text\/(?!event-stream\b))/i
-
-const handleFetchError = (e: unknown): Response =>
-  new Response(null, {
-    status:
-      e instanceof Error && (e.name === 'TimeoutError' || e.constructor.name === 'TimeoutError')
-        ? 504 // timeout error emits 504 timeout
-        : 500,
-  })
-
-const handleResponseError = (e: unknown, outgoing: ServerResponse | Http2ServerResponse) => {
-  const err = (e instanceof Error ? e : new Error('unknown error', { cause: e })) as Error & {
-    code: string
-  }
-  if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-    console.info('The user aborted a request.')
-  } else {
-    console.error(e)
-    outgoing.destroy(err)
-  }
-}
-
-const responseViaCache = (
-  res: Response,
-  outgoing: ServerResponse | Http2ServerResponse
-): undefined | Promise<undefined> => {
-  const [body, header] = (res as any).__cache
-  if (typeof body === 'string') {
-    header['content-length'] ||= '' + Buffer.byteLength(body)
-    outgoing.writeHead((res as Response).status, header)
-    outgoing.end(body)
-  } else {
-    outgoing.writeHead((res as Response).status, header)
-    return writeFromReadableStream(body, outgoing)?.catch(
-      (e) => handleResponseError(e, outgoing) as undefined
-    )
-  }
-}
-
-const responseViaResponseObject = async (
-  res: Response | Promise<Response>,
-  outgoing: ServerResponse | Http2ServerResponse
-) => {
-  if (res instanceof Promise) {
-    res = await res.catch(handleFetchError)
-  }
-  if ('__cache' in res) {
-    try {
-      return responseViaCache(res as Response, outgoing)
-    } catch (e: unknown) {
-      return handleResponseError(e, outgoing)
-    }
-  }
-
-  const resHeaderRecord: OutgoingHttpHeaders = buildOutgoingHttpHeaders(res.headers)
-
-  if (res.body) {
-    try {
-      /**
-       * If content-encoding is set, we assume that the response should be not decoded.
-       * Else if transfer-encoding is set, we assume that the response should be streamed.
-       * Else if content-length is set, we assume that the response content has been taken care of.
-       * Else if x-accel-buffering is set to no, we assume that the response should be streamed.
-       * Else if content-type is not application/json nor text/* but can be text/event-stream,
-       * we assume that the response should be streamed.
-       */
-      if (
-        resHeaderRecord['transfer-encoding'] ||
-        resHeaderRecord['content-encoding'] ||
-        resHeaderRecord['content-length'] ||
-        // nginx buffering variant
-        (resHeaderRecord['x-accel-buffering'] &&
-          regBuffer.test(resHeaderRecord['x-accel-buffering'] as string)) ||
-        !regContentType.test(resHeaderRecord['content-type'] as string)
-      ) {
-        outgoing.writeHead(res.status, resHeaderRecord)
-        await writeFromReadableStream(res.body, outgoing)
-      } else {
-        const buffer = await res.arrayBuffer()
-        resHeaderRecord['content-length'] = buffer.byteLength
-        outgoing.writeHead(res.status, resHeaderRecord)
-        outgoing.end(new Uint8Array(buffer))
-      }
-    } catch (e: unknown) {
-      handleResponseError(e, outgoing)
-    }
-  } else {
-    outgoing.writeHead(res.status, resHeaderRecord)
-    outgoing.end()
-  }
-}
+import { getResponseInternalBody, writeFromReadableStream, kInit, buildOutgoingHttpHeaders } from './utils'
+import type { Response as HonoResponse } from './response'
 
 export const getRequestListener = (fetchCallback: FetchCallback) => {
-  return (
+  return async (
     incoming: IncomingMessage | Http2ServerRequest,
     outgoing: ServerResponse | Http2ServerResponse
   ) => {
-    let res
-
-    // `fetchCallback()` requests a Request object, but global.Request is expensive to generate,
-    // so generate a pseudo Request object with only the minimum required information.
-    const req = Object.create(requestPrototype)
-    req.method = incoming.method || 'GET'
-    req.url = `http://${incoming.headers.host}${incoming.url}`
-    req.incoming = incoming
+    const request = new HonoRequest(incoming)
+    let res: Response
 
     try {
-      res = fetchCallback(req) as Response | Promise<Response>
-      if ('__cache' in res) {
-        // synchronous, cacheable response
-        return responseViaCache(res as Response, outgoing)
-      }
+      const resOrPromise = fetchCallback(request) as Response | Promise<Response>
+      // in order to avoid another await for response
+      res = resOrPromise instanceof Response ? resOrPromise : await resOrPromise
     } catch (e: unknown) {
-      if (!res) {
-        res = handleFetchError(e)
-      } else {
-        return handleResponseError(e, outgoing)
+      res = new Response(null, { status: 500 })
+      if (e instanceof Error) {
+        // timeout error emits 504 timeout
+        if (e.name === 'TimeoutError' || e.constructor.name === 'TimeoutError') {
+          res = new Response(null, { status: 504 })
+        }
       }
     }
 
-    return responseViaResponseObject(res, outgoing)
+    // do not write response if outgoing is already finished
+    if (outgoing.destroyed || outgoing.writableEnded) {
+      console.info('The response is already finished.')
+      return
+    }
+
+    if (outgoing.headersSent) {
+      outgoing.destroy()
+      console.info('The response has already been sent.')
+      return
+    }
+
+    let body: Uint8Array | string | null = null
+    let stream: ReadableStream<Uint8Array> | null = null
+    let headers: HeadersInit | undefined
+    let outgoingHttpHeaders: OutgoingHttpHeaders = {}
+    let status = 200
+    let statusText: string | undefined
+    let length: number | undefined
+
+    // avoid creating real Response if possible
+    const init = (res as unknown as HonoResponse)[kInit]
+
+    if (init) {
+      // the response has a simple body
+      const [kBody, rInit] = init
+      
+      if (rInit) {
+        headers = rInit.headers
+        status = rInit.status
+        statusText = rInit.statusText
+      }
+
+      if (kBody) {
+        if (kBody instanceof ReadableStream) {
+          stream = kBody
+        } else if (kBody instanceof ArrayBuffer) {
+          body = Buffer.from(kBody)
+          length = body.byteLength
+        } else if (typeof kBody === 'string' || kBody instanceof Uint8Array) {
+          body = kBody
+          length = Buffer.byteLength(body)
+        } else if (kBody instanceof URLSearchParams) {
+          body = kBody.toString()
+          length = Buffer.byteLength(body)
+          outgoingHttpHeaders['content-type'] = 'application/x-www-form-urlencoded;charset=UTF-8'
+        } else {
+          throw new TypeError('Invalid body type')
+        }
+      }
+    } else {
+      // first try to get the internal body state of the Response
+      let { source = null, length: len = null } = getResponseInternalBody(res) || {}
+      if (typeof source === 'string' || source instanceof Uint8Array) {
+        body = source
+      }
+
+      if (len !== null && body !== null) {
+        length = len
+      }
+
+      stream = res.body
+      headers = res.headers
+      status = res.status
+      statusText = res.statusText
+    }
+
+    // try to get the native nodejs internal body state if we can
+    buildOutgoingHttpHeaders(headers, outgoingHttpHeaders)
+
+    if (
+      outgoingHttpHeaders['content-length'] === undefined &&
+      outgoingHttpHeaders['transfer-encoding'] === undefined &&
+      length !== undefined
+    ) {
+      // add content-length header if we can
+      outgoingHttpHeaders['content-length'] = String(length)
+      // delete outgoingHttpHeaders['Content-Length']
+      // delete outgoingHttpHeaders['transfer-encoding']
+    }
+
+    // now we can write the response headers and status
+    statusText
+      ? outgoing.writeHead(status, statusText, outgoingHttpHeaders)
+      : outgoing.writeHead(status, outgoingHttpHeaders)
+
+    if (
+      request.method === 'HEAD' ||
+      res.status === 204 ||
+      res.status === 304
+    ) {
+      outgoing.end()
+    } else if (body != null) {
+      outgoing.end(body)
+    } else if (stream) {
+      try {
+        await writeFromReadableStream(stream, outgoing)
+      } catch (e: unknown) {
+        const err = (e instanceof Error ? e : new Error('unknown error', { cause: e })) as Error & {
+          code: string
+        }
+        if (err.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+          console.info('The user aborted a request.')
+        } else {
+          console.error(e)
+          outgoing.destroy(err)
+        }
+      }
+    } else {
+      outgoing.end()
+    }
   }
 }

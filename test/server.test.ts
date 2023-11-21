@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import { compress } from 'hono/compress'
 import { poweredBy } from 'hono/powered-by'
 import { basicAuth } from 'hono/basic-auth'
+import { createServer as createHTTPServer } from 'node:http'
 import { createServer as createHTTPSServer } from 'node:https'
 import { createServer as createHttp2Server } from 'node:http2'
 import fs from 'node:fs'
@@ -223,6 +224,85 @@ describe('Response body', () => {
       expect(res.headers['content-type']).toMatch(/application\/json/)
       expect(JSON.parse(res.text)).toEqual({ foo: 'buffer' })
     })
+  })
+})
+
+describe('Request and Response compatibility', () => {
+  const app = new Hono()
+  app.get('/', c => c.json({ hello: 'world' }))
+
+  app.get('/req', c => {
+    const isRequest = c.req.raw instanceof Request
+    return c.json({ isRequest })
+  })
+
+  const server = createAdaptorServer(app)
+
+  it('should hono raw request be a real Request instance', async () => {
+    const res = await request(server).get('/req')
+    expect(res.body).toEqual({ isRequest: true })
+  })
+
+  it('should hono response should be compatible with nodejs response', async () => {
+    const r = await app.request('/')
+
+    const Res = r.constructor
+
+    expect(Res.name).toBe('Response')
+    let res!: (port: number) => void
+    let rej!: (e: Error) => void
+    const p = new Promise<number>((_res, _rej) => {
+      res = _res
+      rej = _rej
+    })
+
+    const server = createHTTPServer((_req, res) => {
+      res.end('Hello! Node!')
+    })
+    
+    server.listen(0, () => {
+      const addr = server.address()
+      if (addr && typeof addr === 'object') {
+        res(addr?.port)
+      } else {
+        rej(new Error('Invalid address'))
+      }
+    })
+
+    const port = await p
+    expect(port).toBeGreaterThan(0)
+
+    const res2 = await fetch('http://localhost:' + port, { keepalive: false })
+    expect(res2.status).toBe(200)
+    expect(r).toBeInstanceOf(res2.constructor)
+
+    const text = await res2.text()
+    expect(text).toBe('Hello! Node!')
+
+    let resolve2!: () => void
+    const p2 = new Promise<void>(res => {
+      resolve2 = res
+    })
+    server.closeAllConnections()
+    server.close(resolve2)
+    server.unref()
+    await p2
+
+    const RRR = Response as any
+
+    expect(Response).toThrow()
+    expect(Response.error()).toBeInstanceOf(Response)
+    expect(Response.redirect('http://localhost')).toBeInstanceOf(Response)
+
+    // jest typescript think there is no json in `Response`
+    const resJson = RRR.json({ foo: 'bar' })
+    const ssj = await resJson.json()
+    expect(ssj).toEqual({ foo: 'bar' })
+
+    class S extends Response {}
+    const s = new S('text')
+    const t = await s.text()
+    expect(t).toBe('text')
   })
 })
 
