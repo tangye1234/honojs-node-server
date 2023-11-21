@@ -117,8 +117,8 @@ export const getRequestListener = (fetchCallback: FetchCallback) => {
 
     if (
       request.method === 'HEAD' ||
-      res.status === 204 ||
-      res.status === 304
+      status === 204 ||
+      status === 304
     ) {
       outgoing.end()
     } else if (body != null) {
