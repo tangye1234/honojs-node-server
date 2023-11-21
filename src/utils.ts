@@ -26,20 +26,17 @@ export function getResponseInternalBody(response: Response) {
 export function writeFromReadableStream(stream: ReadableStream<Uint8Array>, writable: Writable) {
   if (stream.locked) {
     throw new TypeError('ReadableStream is locked.')
-  }
-  const reader = stream.getReader()
-  if (writable.destroyed) {
-    reader.cancel()
+  } else if (writable.destroyed) {
+    stream.cancel();
     return
   }
-  writable.on('drain', onDrain)
+  const reader = stream.getReader()
   writable.on('close', cancel)
   writable.on('error', cancel)
   reader.read().then(flow, cancel)
   return reader.closed.finally(() => {
     writable.off('close', cancel)
     writable.off('error', cancel)
-    writable.off('drain', onDrain)
   })
   function cancel(error?: any) {
     reader.cancel(error).catch(() => {})
@@ -52,7 +49,9 @@ export function writeFromReadableStream(stream: ReadableStream<Uint8Array>, writ
     try {
       if (done) {
         writable.end()
-      } else if (writable.write(value)) {
+      } else if (!writable.write(value)) {
+        writable.once("drain", onDrain);
+      } else {
         return reader.read().then(flow, cancel)
       }
     } catch (e) {
